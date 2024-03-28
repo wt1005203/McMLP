@@ -18,10 +18,14 @@ withBaselineMetabolome = sys.argv[2]
 print(path_prefix_data, withBaselineMetabolome)
 
 # Load Data
-X_train_ori = pd.read_csv(path_prefix_data + "X_train.csv", header=None).values;
-y_train_ori = pd.read_csv(path_prefix_data + "y_train.csv", header=None).values;
-X_test_ori = pd.read_csv(path_prefix_data + "X_test.csv", header=None).values;
-y_test_ori = pd.read_csv(path_prefix_data + "y_test.csv", header=None).values;
+df_X_train_ori = pd.read_csv(path_prefix_data + "X_train.csv", index_col=0)
+df_y_train_ori = pd.read_csv(path_prefix_data + "y_train.csv", index_col=0)
+df_X_test_ori = pd.read_csv(path_prefix_data + "X_test.csv", index_col=0)
+df_y_test_ori = pd.read_csv(path_prefix_data + "y_test.csv", index_col=0)
+X_train_ori = df_X_train_ori.values;
+y_train_ori = df_y_train_ori.values;
+X_test_ori = df_X_test_ori.values;
+y_test_ori = df_y_test_ori.values;
 compound_name = pd.read_csv(path_prefix_data + "compound_names.csv", delimiter="\t", header=None).values.flatten();
 Nm = compound_name.shape[0]
 Ni = X_train_ori.shape[1] - y_train_ori.shape[1] #### interventions
@@ -68,6 +72,110 @@ def spearman(target, pred):
     metabolites_corr = df1.corrwith(df2, axis = 0, method='spearman').values
     return np.nanmean(metabolites_corr)
 
+def MLP(Nlayers, layer_size, weight_decay, dropout, X_train, X_test, y_train, y_test):
+    from sklearn.preprocessing import StandardScaler 
+    scaler_x = StandardScaler()  
+    scaler_x.fit(X_train)
+    X_train = scaler_x.transform(X_train)  
+    X_test = scaler_x.transform(X_test)  
+    scaler_y = StandardScaler()  
+    scaler_y.fit(y_train)
+    y_train = scaler_y.transform(y_train)  
+    y_test = scaler_y.transform(y_test)  
+    
+    #### convert to tensor
+    X_train = torch.FloatTensor(X_train); y_train = torch.FloatTensor(y_train)
+    X_test = torch.FloatTensor(X_test); y_test = torch.FloatTensor(y_test)
+    
+    # Use torch.utils.data to create a DataLoader 
+    # that will take care of creating batches 
+    BATCH_SIZE = 64
+    dataset = TensorDataset(X_train, y_train)
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+
+    #### Train the model
+    model = Feedforward(X_train.shape[1], layer_size, y_train.shape[1], dropout, Nlayers)
+    criterion = torch.nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=weight_decay)
+
+    #### Train the model
+    model.eval()
+    y_pred = model(X_test)
+    before_train = spearman(y_pred.squeeze(), y_test) 
+    model.train()
+    epoch = 1000
+    test_error = []
+    for epoch in range(epoch):
+        # Loop over batches in an epoch using DataLoader
+        for id_batch, (X_batch, y_batch) in enumerate(dataloader):
+            #print(id_batch)
+            # Forward pass
+            y_batch_pred = model(X_batch)
+            # Compute Loss
+            loss = criterion(y_batch_pred.squeeze(), y_batch)
+            # Backward pass
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        if epoch%20==0:
+            model.eval()
+            y_pred = model(X_test)
+            after_train = spearman(y_pred.squeeze(), y_test) 
+            test_error = test_error + [after_train]
+            if (loss < 0.1) and (test_error[-1] - test_error[-2]) < 0:
+                model = copy.deepcopy(previous_model)
+                break
+            previous_model = copy.deepcopy(model)
+
+    #### Evaluate the model
+    model.eval()
+    y_pred = model(X_test)
+    after_train = spearman(y_pred.squeeze(), y_test) 
+
+    from scipy.stats import spearmanr
+    x_plot = y_pred.detach().numpy()
+    y_plot = y_test.detach().numpy()
+    metabolites_corr = np.zeros(x_plot.shape[1])
+    for i in range(x_plot.shape[1]):
+        metabolites_corr[i] = spearmanr(x_plot[:,i], y_plot[:,i])[0]
+    
+    return test_error[-1].item(), np.nanmean(metabolites_corr)
+
+def cross_validation(X_train, y_train, Nlayers_list, layer_size_list, weight_decay_list, dropout_list):
+    from sklearn.model_selection import ShuffleSplit # or StratifiedShuffleSplit
+    from sklearn.model_selection import KFold
+    import time
+    start = time.time()
+    n_splits = 5
+    kf = KFold(n_splits=n_splits)
+    kf.get_n_splits(X_train)
+
+
+    test_error_for_all_hyperparameters = np.zeros((len(Nlayers_list), len(layer_size_list), 
+                                                   len(weight_decay_list), len(dropout_list)))
+    Spearmac_CC_for_all_hyperparameters = np.zeros((len(Nlayers_list), len(layer_size_list), 
+                                                   len(weight_decay_list), len(dropout_list)))
+    for i, Nlayers in enumerate(Nlayers_list):
+        for j, layer_size in enumerate(layer_size_list):
+            for k, weight_decay in enumerate(weight_decay_list):
+                for l, dropout in enumerate(dropout_list):
+                    #print("="*50)
+                    #print(Nlayers, layer_size, weight_decay, dropout)
+                    final_test_error_list = []
+                    final_Spearmac_CC_list = []
+                    for train_index, test_index in kf.split(X_train):
+                        X_train_5fold, X_test_5fold = X_train[train_index], X_train[test_index]
+                        y_train_5fold, y_test_5fold = y_train[train_index], y_train[test_index]
+                        final_test_error, final_Spearmac_CC = MLP(Nlayers, layer_size, weight_decay, dropout, X_train_5fold, X_test_5fold, y_train_5fold, y_test_5fold)
+                        final_test_error_list = final_test_error_list + [final_test_error]
+                        final_Spearmac_CC_list = final_Spearmac_CC_list + [final_Spearmac_CC]
+                    test_error_for_all_hyperparameters[i,j,k,l] = np.mean(final_test_error_list)
+                    Spearmac_CC_for_all_hyperparameters[i,j,k,l] = np.mean(final_Spearmac_CC_list)
+    stop = time.time()
+    print("The computing time (s): {:.3f}".format(stop - start))
+    return test_error_for_all_hyperparameters, Spearmac_CC_for_all_hyperparameters
+
 def prediction(X_train, X_test, y_train, y_test, Nlayers, layer_size, weight_decay, dropout):
     #### convert to tensor
     X_train = torch.FloatTensor(X_train); y_train = torch.FloatTensor(y_train)
@@ -90,8 +198,7 @@ def prediction(X_train, X_test, y_train, y_test, Nlayers, layer_size, weight_dec
     before_train = spearman(y_pred.squeeze(), y_test) 
     model.train()
     epoch = 1000
-    test_SCC = []
-    model_list = []
+    test_error = []
     for epoch in range(epoch):
         # Loop over batches in an epoch using DataLoader
         for id_batch, (X_batch, y_batch) in enumerate(dataloader):
@@ -104,15 +211,17 @@ def prediction(X_train, X_test, y_train, y_test, Nlayers, layer_size, weight_dec
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            
-        model.eval()
-        y_pred = model(X_test)
-        after_train = spearman(y_pred.squeeze(), y_test) 
-        test_SCC = test_SCC + [after_train]
-        model_list = model_list + [copy.deepcopy(model)]
-        if (loss < 0.1) and (test_SCC[-1] - test_SCC[-21]) < 0: 
-            model = copy.deepcopy(model_list[-(20-np.argmax(test_SCC[-20:]))]) 
-            break
+
+        if epoch%20==0:
+            model.eval()
+            y_pred = model(X_test)
+            #after_train = criterion(y_pred.squeeze(), y_test) 
+            after_train = spearman(y_pred.squeeze(), y_test) 
+            test_error = test_error + [after_train]
+            if (loss < 0.1) and (test_error[-1] - test_error[-2]) < 0:
+                model = copy.deepcopy(previous_model)
+                break
+            previous_model = copy.deepcopy(model)
 
     #### Evaluate the model
     model.eval()
@@ -266,7 +375,7 @@ for i_species_perturbed in range(microbe_name.shape[0]):
     sensitivity_all[i_species_perturbed, :] = np.mean(sensitivity, 0)
 
 ########### Save data
-np.savetxt("./results/sensitivity_diet_and_microbes.csv", sensitivity_consumption.mean(0), delimiter=',')
-np.savetxt("./results/sensitivity_microbes_and_metabolites.csv", sensitivity_all, delimiter=',')
+pd.DataFrame(data=sensitivity_consumption.mean(0).reshape(-1,1), index=df_y_test_ori.columns[:-Nm], columns=df_X_test_ori.columns[-Ni:]).to_csv("./results/sensitivity_diet_and_microbes.csv")
+pd.DataFrame(data=sensitivity_all, index=df_y_test_ori.columns[:-Nm], columns=df_y_test_ori.columns[-Nm:]).to_csv("./results/sensitivity_microbes_and_metabolites.csv")
 
 print("The sensitivities are saved.")
